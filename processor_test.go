@@ -17,11 +17,17 @@ func TestIsSupportedImage(t *testing.T) {
 	}
 }
 
-func TestDerivedObjectPattern(t *testing.T) {
-	if !derivedObjectPattern.MatchString("images/demo-w800.jpg") {
-		t.Fatal("expected derived pattern to match resized image")
+func TestIsDerivedObjectName(t *testing.T) {
+	if !isDerivedObjectName("images/demo-w2400.jpg") {
+		t.Fatal("expected w2400 resized image to be treated as derived")
 	}
-	if derivedObjectPattern.MatchString("images/demo.jpg") {
-		t.Fatal("expected original image not to match derived pattern")
+	if !isDerivedObjectName("images/demo-w800.jpg") {
+		t.Fatal("expected resized image to be treated as derived")
+	}
+	if !isDerivedObjectName("images/demo-w480.webP") {
+		t.Fatal("expected generated mixed-case webP to be treated as derived")
+	}
+	if isDerivedObjectName("images/demo.jpg") {
+		t.Fatal("expected original image not to be treated as derived")
 	}
 }

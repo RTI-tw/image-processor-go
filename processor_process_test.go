@@ -20,6 +20,9 @@ func TestProcess_SkipsUnsupportedAndDerived(t *testing.T) {
 	if err := p.Process(ctx, storageEvent{Bucket: "b", Name: "images/a-w480.jpg"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := p.Process(ctx, storageEvent{Bucket: "b", Name: "images/a-w2400.jpg"}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestProcess_NilStoragePanicsForSupportedImage(t *testing.T) {
