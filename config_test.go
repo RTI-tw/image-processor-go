@@ -43,6 +43,20 @@ func TestLoadConfig_DefaultsAndWatermarkError(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_DefaultMaxSourcePixels(t *testing.T) {
+	t.Setenv("RESIZE_TARGETS", "w480")
+	t.Setenv("ENABLE_WATERMARK", "false")
+	t.Setenv("MAX_SOURCE_PIXELS", "")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxSourcePixels != 30000000 {
+		t.Fatalf("expected default max source pixels to be 30000000, got %d", cfg.MaxSourcePixels)
+	}
+}
+
 func TestParseResizeTargets(t *testing.T) {
 	targets, err := ParseResizeTargets("w480,w800,w1200")
 	if err != nil {

@@ -5,6 +5,8 @@ import (
 	"context"
 	"image"
 	"image/jpeg"
+	"io"
+	"strconv"
 	"testing"
 
 	"github.com/fsouza/fake-gcs-server/fakestorage"
@@ -60,6 +62,68 @@ func TestProcess_WithFakeGCS(t *testing.T) {
 	}
 }
 
+func TestProcess_CopiesSourceWhenTargetWouldUpsize(t *testing.T) {
+	jpg := jpegFixture(t)
+	srv, err := fakestorage.NewServerWithOptions(fakestorage.Options{
+		Scheme: "http",
+		InitialObjects: []fakestorage.Object{
+			{
+				ObjectAttrs: fakestorage.ObjectAttrs{
+					BucketName: "test-bucket",
+					Name:       "images/pipe.jpg",
+				},
+				Content: jpg,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+
+	client := srv.Client()
+	cfg := Config{
+		ResizeTargets:   []ResizeTarget{{Label: "w64", Width: 64}},
+		EnableWatermark: false,
+		CacheControl:    "public, max-age=1",
+	}
+	p, err := NewProcessor(cfg, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	sourceAttrs, err := client.Bucket("test-bucket").Object("images/pipe.jpg").Attrs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceGeneration := strconv.FormatInt(sourceAttrs.Generation, 10)
+	if err := p.Process(ctx, storageEvent{Bucket: "test-bucket", Name: "images/pipe.jpg", Generation: sourceGeneration}); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := client.Bucket("test-bucket").Object("images/pipe-w64.jpg").NewReader(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, jpg) {
+		t.Fatal("expected upsize target to be copied from source")
+	}
+	attrs, err := client.Bucket("test-bucket").Object("images/pipe-w64.jpg").Attrs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attrs.Metadata["sourceGeneration"] != sourceGeneration {
+		t.Fatalf("expected sourceGeneration metadata, got %+v", attrs.Metadata)
+	}
+}
+
 func TestProcess_SkipsDuplicateSourceGeneration(t *testing.T) {
 	jpg := jpegFixture(t)
 	srv, err := fakestorage.NewServerWithOptions(fakestorage.Options{
@@ -91,7 +155,12 @@ func TestProcess_SkipsDuplicateSourceGeneration(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if err := p.Process(ctx, storageEvent{Bucket: "test-bucket", Name: "images/pipe.jpg", Generation: "111"}); err != nil {
+	sourceAttrs, err := client.Bucket("test-bucket").Object("images/pipe.jpg").Attrs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSourceGeneration := strconv.FormatInt(sourceAttrs.Generation, 10)
+	if err := p.Process(ctx, storageEvent{Bucket: "test-bucket", Name: "images/pipe.jpg", Generation: firstSourceGeneration}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -99,14 +168,14 @@ func TestProcess_SkipsDuplicateSourceGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if firstAttrs.Metadata["sourceGeneration"] != "111" {
+	if firstAttrs.Metadata["sourceGeneration"] != firstSourceGeneration {
 		t.Fatalf("expected sourceGeneration metadata, got %+v", firstAttrs.Metadata)
 	}
 
 	if err := client.Bucket("test-bucket").Object("images/pipe-w480.webP").Delete(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Process(ctx, storageEvent{Bucket: "test-bucket", Name: "images/pipe.jpg", Generation: "111"}); err != nil {
+	if err := p.Process(ctx, storageEvent{Bucket: "test-bucket", Name: "images/pipe.jpg", Generation: firstSourceGeneration}); err != nil {
 		t.Fatal(err)
 	}
 	recoveredAttrs, err := client.Bucket("test-bucket").Object("images/pipe-w480.jpg").Attrs(ctx)
@@ -117,7 +186,7 @@ func TestProcess_SkipsDuplicateSourceGeneration(t *testing.T) {
 		t.Fatal("missing completion sentinel should allow retry to rebuild outputs")
 	}
 
-	if err := p.Process(ctx, storageEvent{Bucket: "test-bucket", Name: "images/pipe.jpg", Generation: "111"}); err != nil {
+	if err := p.Process(ctx, storageEvent{Bucket: "test-bucket", Name: "images/pipe.jpg", Generation: firstSourceGeneration}); err != nil {
 		t.Fatal(err)
 	}
 	duplicateAttrs, err := client.Bucket("test-bucket").Object("images/pipe-w480.jpg").Attrs(ctx)
@@ -128,7 +197,15 @@ func TestProcess_SkipsDuplicateSourceGeneration(t *testing.T) {
 		t.Fatalf("duplicate source generation should not rewrite output: recovered=%d duplicate=%d", recoveredAttrs.Generation, duplicateAttrs.Generation)
 	}
 
-	if err := p.Process(ctx, storageEvent{Bucket: "test-bucket", Name: "images/pipe.jpg", Generation: "222"}); err != nil {
+	writer := client.Bucket("test-bucket").Object("images/pipe.jpg").NewWriter(ctx)
+	if _, err := writer.Write(jpg); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	newSourceGeneration := strconv.FormatInt(writer.Attrs().Generation, 10)
+	if err := p.Process(ctx, storageEvent{Bucket: "test-bucket", Name: "images/pipe.jpg", Generation: newSourceGeneration}); err != nil {
 		t.Fatal(err)
 	}
 	newAttrs, err := client.Bucket("test-bucket").Object("images/pipe-w480.jpg").Attrs(ctx)
@@ -138,7 +215,7 @@ func TestProcess_SkipsDuplicateSourceGeneration(t *testing.T) {
 	if newAttrs.Generation == duplicateAttrs.Generation {
 		t.Fatal("new source generation should rewrite output")
 	}
-	if newAttrs.Metadata["sourceGeneration"] != "222" {
+	if newAttrs.Metadata["sourceGeneration"] != newSourceGeneration {
 		t.Fatalf("expected updated sourceGeneration metadata, got %+v", newAttrs.Metadata)
 	}
 }

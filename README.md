@@ -31,7 +31,7 @@ HTTP endpoint:
 - `WATERMARK_MARGIN_RATIO`: watermark 與邊界距離比例，預設 `0.025`
 - `WATERMARK_OPACITY`: `0` 到 `1`，預設 `1.0`
 - `CACHE_CONTROL`: 上傳到 GCS 時寫入的 cache control，預設 `public, max-age=31536000`
-- `MAX_SOURCE_PIXELS`: 原圖 decode 前允許的最高像素數，預設 `60000000`；設為 `0` 可關閉限制
+- `MAX_SOURCE_PIXELS`: 原圖 decode 前允許的最高像素數，預設 `30000000`；設為 `0` 可關閉限制
 - `LOG_MEMORY`: 設為 `true` 時，處理每張圖會輸出 Go heap memory checkpoints，方便排查 Cloud Run OOM
 
 ## 本機執行
@@ -69,5 +69,7 @@ go run .
 - 若 GCS event 帶有 source object generation，輸出物件會寫入 `sourceGeneration` metadata；同一個 source generation 重送時，服務會用最後一個 resize target 的 `.webP` 當完成 sentinel 直接略過，避免重複 resize
 - 每個 resize target 會輸出原副檔名版本，例如 `images/foo-w800.jpg`
 - 每個 resize target 也會輸出 WebP 版本，例如 `images/foo-w800.webP`
+- 若 source 寬度不大於 resize target，原副檔名版本會直接從 GCS source copy，不放大重編；`.webP` 仍會用 source 尺寸輸出
+- 原尺寸 `.webP` 會在 resize targets 完成後再 best-effort 產生，避免阻塞主要 resize 輸出
 
 GCS notification 仍會對每個新物件送出事件。若要從源頭減少 Pub/Sub 訊息量，應把 source 與衍生檔放在不同 prefix 或 bucket，並只對 source prefix 建立 notification；只靠 subscription filter 無法可靠排除 `-w###` suffix。
