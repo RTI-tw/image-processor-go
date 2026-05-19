@@ -40,7 +40,7 @@ func LoadConfig() (Config, error) {
 		WatermarkMarginRatio: parseFloatEnv("WATERMARK_MARGIN_RATIO", 0.025),
 		WatermarkOpacity:     parseFloatEnv("WATERMARK_OPACITY", 1.0),
 		CacheControl:         envOrDefault("CACHE_CONTROL", "public, max-age=31536000"),
-		MaxSourcePixels:      parseIntEnv("MAX_SOURCE_PIXELS", 60000000),
+		MaxSourcePixels:      parseIntEnv("MAX_SOURCE_PIXELS", 30000000),
 		LogMemory:            parseBoolEnv("LOG_MEMORY", false),
 	}
 

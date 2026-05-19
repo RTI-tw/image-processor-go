@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"cloud.google.com/go/storage"
@@ -84,7 +85,8 @@ func (p *Processor) Process(ctx context.Context, event storageEvent) error {
 		return nil
 	}
 
-	reader, err := p.storage.Bucket(event.Bucket).Object(event.Name).NewReader(ctx)
+	sourceObject := p.sourceObject(event.Bucket, event.Name, event.Generation)
+	reader, err := sourceObject.NewReader(ctx)
 	if err != nil {
 		return fmt.Errorf("open object: %w", err)
 	}
@@ -96,10 +98,12 @@ func (p *Processor) Process(ctx context.Context, event storageEvent) error {
 	}
 	p.logMemory(event.Name, fmt.Sprintf("read original bytes=%d", len(originalBytes)))
 	if p.cfg.MaxSourcePixels > 0 {
-		if imgCfg, _, err := image.DecodeConfig(bytes.NewReader(originalBytes)); err == nil {
-			if err := validateSourceImageSize(imgCfg.Width, imgCfg.Height, p.cfg.MaxSourcePixels); err != nil {
-				return err
-			}
+		imgCfg, _, err := image.DecodeConfig(bytes.NewReader(originalBytes))
+		if err != nil {
+			return fmt.Errorf("decode image config: %w", err)
+		}
+		if err := validateSourceImageSize(imgCfg.Width, imgCfg.Height, p.cfg.MaxSourcePixels); err != nil {
+			return err
 		}
 	}
 	sourceImg, _, err := image.Decode(bytes.NewReader(originalBytes))
@@ -110,49 +114,53 @@ func (p *Processor) Process(ctx context.Context, event storageEvent) error {
 	originalBytes = nil
 	p.logMemory(event.Name, fmt.Sprintf("decoded source bounds=%s", sourceImg.Bounds()))
 
-	originalWebPBytes, err := encodeWebP(sourceImg)
-	if err != nil {
-		return fmt.Errorf("encode %s: %w", originalWebPName, err)
-	}
-	p.logMemory(event.Name, fmt.Sprintf("encoded original webp bytes=%d", len(originalWebPBytes)))
-	if err := p.uploadObject(ctx, event.Bucket, originalWebPName, "image/webp", originalWebPBytes, event.Generation); err != nil {
-		return err
-	}
-	originalWebPBytes = nil
-	p.logMemory(event.Name, "uploaded original webp")
-
 	for _, target := range p.cfg.ResizeTargets {
-		resized := resizeImage(sourceImg, target.Width)
-		if p.cfg.EnableWatermark {
-			resized = applyWatermark(resized, p.watermark, p.cfg.WatermarkScale, p.cfg.WatermarkMarginRatio, p.cfg.WatermarkOpacity)
+		shouldCopyMain := !p.cfg.EnableWatermark && sourceImg.Bounds().Dx() <= target.Width
+		var targetImg image.Image = sourceImg
+		var resized *image.NRGBA
+		if !shouldCopyMain {
+			resized = resizeImage(sourceImg, target.Width)
+			targetImg = resized
 		}
-		p.logMemory(event.Name, fmt.Sprintf("resized target=%s bounds=%s", target.Label, resized.Bounds()))
+		if p.cfg.EnableWatermark && resized != nil {
+			resized = applyWatermark(resized, p.watermark, p.cfg.WatermarkScale, p.cfg.WatermarkMarginRatio, p.cfg.WatermarkOpacity)
+			targetImg = resized
+		}
+		p.logMemory(event.Name, fmt.Sprintf("prepared target=%s bounds=%s", target.Label, targetImg.Bounds()))
 
 		mainObjectName := baseDir + imageFileID + "-" + target.Label + ext
-		mainBytes, err := encodeByExt(resized, ext)
-		if err != nil {
-			return fmt.Errorf("encode %s: %w", mainObjectName, err)
+		if shouldCopyMain {
+			if err := p.copyObject(ctx, event.Bucket, sourceObject, mainObjectName, contentTypeFromExt(ext), event.Generation); err != nil {
+				return err
+			}
+			p.logMemory(event.Name, fmt.Sprintf("copied target=%s format=%s", target.Label, ext))
+		} else {
+			if err := p.uploadEncodedObject(ctx, event.Bucket, mainObjectName, contentTypeFromExt(ext), event.Generation, func(w io.Writer) error {
+				return encodeByExtToWriter(w, targetImg, ext)
+			}); err != nil {
+				return fmt.Errorf("encode %s: %w", mainObjectName, err)
+			}
+			p.logMemory(event.Name, fmt.Sprintf("encoded and uploaded target=%s format=%s", target.Label, ext))
 		}
-		p.logMemory(event.Name, fmt.Sprintf("encoded target=%s format=%s bytes=%d", target.Label, ext, len(mainBytes)))
-		if err := p.uploadObject(ctx, event.Bucket, mainObjectName, contentTypeFromExt(ext), mainBytes, event.Generation); err != nil {
-			return err
-		}
-		mainBytes = nil
-		p.logMemory(event.Name, fmt.Sprintf("uploaded target=%s format=%s", target.Label, ext))
 
 		webpObjectName := baseDir + imageFileID + "-" + target.Label + ".webP"
-		webpBytes, err := encodeWebP(resized)
-		if err != nil {
+		if err := p.uploadEncodedObject(ctx, event.Bucket, webpObjectName, "image/webp", event.Generation, func(w io.Writer) error {
+			return encodeWebPToWriter(w, targetImg)
+		}); err != nil {
 			return fmt.Errorf("encode %s: %w", webpObjectName, err)
 		}
-		p.logMemory(event.Name, fmt.Sprintf("encoded target=%s format=.webP bytes=%d", target.Label, len(webpBytes)))
-		if err := p.uploadObject(ctx, event.Bucket, webpObjectName, "image/webp", webpBytes, event.Generation); err != nil {
-			return err
-		}
 
-		webpBytes = nil
 		resized = nil
-		p.logMemory(event.Name, fmt.Sprintf("uploaded target=%s format=.webP", target.Label))
+		targetImg = nil
+		p.logMemory(event.Name, fmt.Sprintf("encoded and uploaded target=%s format=.webP", target.Label))
+	}
+
+	if err := p.uploadEncodedObject(ctx, event.Bucket, originalWebPName, "image/webp", event.Generation, func(w io.Writer) error {
+		return encodeWebPToWriter(w, sourceImg)
+	}); err != nil {
+		log.Printf("failed to encode deferred original webp for %s: %v", event.Name, err)
+	} else {
+		p.logMemory(event.Name, "encoded and uploaded deferred original webp")
 	}
 
 	sourceImg = nil
@@ -184,6 +192,15 @@ func bytesToMiB(v uint64) uint64 {
 	return v / 1024 / 1024
 }
 
+func (p *Processor) sourceObject(bucketName, objectName, sourceGeneration string) *storage.ObjectHandle {
+	object := p.storage.Bucket(bucketName).Object(objectName)
+	generation, err := strconv.ParseInt(sourceGeneration, 10, 64)
+	if err != nil || generation <= 0 {
+		return object
+	}
+	return object.Generation(generation)
+}
+
 func (p *Processor) alreadyProcessedSourceGeneration(ctx context.Context, bucketName, sentinelObjectName, sourceGeneration string) (bool, error) {
 	if sourceGeneration == "" {
 		return false, nil
@@ -213,7 +230,7 @@ func completionSentinelObjectName(baseDir, imageFileID, fallback string, targets
 	return baseDir + imageFileID + "-" + targets[len(targets)-1].Label + ".webP"
 }
 
-func (p *Processor) uploadObject(ctx context.Context, bucketName, objectName, contentType string, payload []byte, sourceGeneration string) error {
+func (p *Processor) uploadEncodedObject(ctx context.Context, bucketName, objectName, contentType, sourceGeneration string, encode func(io.Writer) error) error {
 	writer := p.storage.Bucket(bucketName).Object(objectName).NewWriter(ctx)
 	writer.ContentType = contentType
 	writer.CacheControl = p.cfg.CacheControl
@@ -223,15 +240,32 @@ func (p *Processor) uploadObject(ctx context.Context, bucketName, objectName, co
 		}
 	}
 
-	if _, err := writer.Write(payload); err != nil {
+	if err := encode(writer); err != nil {
 		_ = writer.Close()
-		return fmt.Errorf("write object %s: %w", objectName, err)
+		return err
 	}
 	if err := writer.Close(); err != nil {
 		return fmt.Errorf("close object %s: %w", objectName, err)
 	}
 
 	log.Printf("uploaded gs://%s/%s", bucketName, objectName)
+	return nil
+}
+
+func (p *Processor) copyObject(ctx context.Context, bucketName string, sourceObject *storage.ObjectHandle, objectName, contentType, sourceGeneration string) error {
+	copier := p.storage.Bucket(bucketName).Object(objectName).CopierFrom(sourceObject)
+	copier.ContentType = contentType
+	copier.CacheControl = p.cfg.CacheControl
+	if sourceGeneration != "" {
+		copier.Metadata = map[string]string{
+			sourceGenerationMetadataKey: sourceGeneration,
+		}
+	}
+	if _, err := copier.Run(ctx); err != nil {
+		return fmt.Errorf("copy object %s: %w", objectName, err)
+	}
+
+	log.Printf("copied gs://%s/%s", bucketName, objectName)
 	return nil
 }
 
@@ -315,47 +349,41 @@ func applyWatermark(base *image.NRGBA, watermark *image.NRGBA, scale, marginRati
 		y = 0
 	}
 
-	result := cloneNRGBA(base)
 	rect := image.Rect(x, y, x+scaled.Bounds().Dx(), y+scaled.Bounds().Dy())
-	imagedraw.Draw(result, rect, scaled, image.Point{}, imagedraw.Over)
-	return result
+	imagedraw.Draw(base, rect, scaled, image.Point{}, imagedraw.Over)
+	return base
 }
 
 func adjustOpacity(img *image.NRGBA, opacity float64) *image.NRGBA {
-	out := cloneNRGBA(img)
-	for i := 3; i < len(out.Pix); i += 4 {
-		out.Pix[i] = uint8(float64(out.Pix[i]) * opacity)
+	for i := 3; i < len(img.Pix); i += 4 {
+		img.Pix[i] = uint8(float64(img.Pix[i]) * opacity)
 	}
-	return out
+	return img
 }
 
 func encodeByExt(img image.Image, ext string) ([]byte, error) {
 	var buf bytes.Buffer
-	switch strings.ToLower(ext) {
-	case ".jpg", ".jpeg":
-		if err := jpeg.Encode(&buf, flattenIfNeeded(img), &jpeg.Options{Quality: 85}); err != nil {
-			return nil, err
-		}
-	case ".png":
-		if err := png.Encode(&buf, img); err != nil {
-			return nil, err
-		}
-	case ".gif":
-		if err := gif.Encode(&buf, flattenIfNeeded(img), nil); err != nil {
-			return nil, err
-		}
-	case ".tif", ".tiff":
-		if err := xtiff.Encode(&buf, img, nil); err != nil {
-			return nil, err
-		}
-	case ".webp":
-		return encodeWebP(img)
-	default:
-		if err := jpeg.Encode(&buf, flattenIfNeeded(img), &jpeg.Options{Quality: 85}); err != nil {
-			return nil, err
-		}
+	if err := encodeByExtToWriter(&buf, img, ext); err != nil {
+		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func encodeByExtToWriter(w io.Writer, img image.Image, ext string) error {
+	switch strings.ToLower(ext) {
+	case ".jpg", ".jpeg":
+		return jpeg.Encode(w, flattenIfNeeded(img), &jpeg.Options{Quality: 85})
+	case ".png":
+		return png.Encode(w, img)
+	case ".gif":
+		return gif.Encode(w, flattenIfNeeded(img), nil)
+	case ".tif", ".tiff":
+		return xtiff.Encode(w, img, nil)
+	case ".webp":
+		return encodeWebPToWriter(w, img)
+	default:
+		return jpeg.Encode(w, flattenIfNeeded(img), &jpeg.Options{Quality: 85})
+	}
 }
 
 func applyEXIFOrientation(img image.Image, data []byte) image.Image {
@@ -395,8 +423,10 @@ func rotate180(src image.Image) *image.NRGBA {
 	height := bounds.Dy()
 	dst := image.NewNRGBA(image.Rect(0, 0, width, height))
 	for y := 0; y < height; y++ {
+		srcOffset := y * img.Stride
 		for x := 0; x < width; x++ {
-			dst.Set(width-1-x, height-1-y, img.At(x, y))
+			dstOffset := (height-1-y)*dst.Stride + (width-1-x)*4
+			copy(dst.Pix[dstOffset:dstOffset+4], img.Pix[srcOffset+x*4:srcOffset+x*4+4])
 		}
 	}
 	return dst
@@ -409,8 +439,10 @@ func rotate90CW(src image.Image) *image.NRGBA {
 	height := bounds.Dy()
 	dst := image.NewNRGBA(image.Rect(0, 0, height, width))
 	for y := 0; y < height; y++ {
+		srcOffset := y * img.Stride
 		for x := 0; x < width; x++ {
-			dst.Set(height-1-y, x, img.At(x, y))
+			dstOffset := x*dst.Stride + (height-1-y)*4
+			copy(dst.Pix[dstOffset:dstOffset+4], img.Pix[srcOffset+x*4:srcOffset+x*4+4])
 		}
 	}
 	return dst
@@ -423,8 +455,10 @@ func rotate90CCW(src image.Image) *image.NRGBA {
 	height := bounds.Dy()
 	dst := image.NewNRGBA(image.Rect(0, 0, height, width))
 	for y := 0; y < height; y++ {
+		srcOffset := y * img.Stride
 		for x := 0; x < width; x++ {
-			dst.Set(y, width-1-x, img.At(x, y))
+			dstOffset := (width-1-x)*dst.Stride + y*4
+			copy(dst.Pix[dstOffset:dstOffset+4], img.Pix[srcOffset+x*4:srcOffset+x*4+4])
 		}
 	}
 	return dst
@@ -432,21 +466,40 @@ func rotate90CCW(src image.Image) *image.NRGBA {
 
 func encodeWebP(img image.Image) ([]byte, error) {
 	var buf bytes.Buffer
-	err := webp.Encode(&buf, img, webp.Options{
-		Quality: 85,
-		Method:  4,
-	})
-	if err != nil {
+	if err := encodeWebPToWriter(&buf, img); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
 }
 
+func encodeWebPToWriter(w io.Writer, img image.Image) error {
+	return webp.Encode(w, img, webp.Options{
+		Quality: 85,
+		Method:  2,
+	})
+}
+
 func flattenIfNeeded(img image.Image) image.Image {
+	switch typed := img.(type) {
+	case *image.NRGBA:
+		if !hasAlpha(typed) {
+			return typed
+		}
+		return flattenNRGBA(typed)
+	case *image.RGBA:
+		if !hasAlphaRGBA(typed) {
+			return typed
+		}
+	}
+
 	nrgba := toNRGBA(img)
 	if !hasAlpha(nrgba) {
 		return nrgba
 	}
+	return flattenNRGBA(nrgba)
+}
+
+func flattenNRGBA(nrgba *image.NRGBA) *image.RGBA {
 	rgba := image.NewRGBA(nrgba.Bounds())
 	imagedraw.Draw(rgba, rgba.Bounds(), image.NewUniform(image.White), image.Point{}, imagedraw.Src)
 	imagedraw.Draw(rgba, rgba.Bounds(), nrgba, image.Point{}, imagedraw.Over)
@@ -454,6 +507,15 @@ func flattenIfNeeded(img image.Image) image.Image {
 }
 
 func hasAlpha(img *image.NRGBA) bool {
+	for i := 3; i < len(img.Pix); i += 4 {
+		if img.Pix[i] != 0xff {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAlphaRGBA(img *image.RGBA) bool {
 	for i := 3; i < len(img.Pix); i += 4 {
 		if img.Pix[i] != 0xff {
 			return true
