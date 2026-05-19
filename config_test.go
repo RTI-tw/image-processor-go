@@ -10,6 +10,7 @@ func TestLoadConfig_DefaultsAndWatermarkError(t *testing.T) {
 		for _, k := range []string{
 			"RESIZE_TARGETS", "ENABLE_WATERMARK", "WATERMARK_PATH", "PORT",
 			"MAX_SOURCE_PIXELS",
+			"LOG_MEMORY",
 		} {
 			_ = os.Unsetenv(k)
 		}
@@ -26,6 +27,7 @@ func TestLoadConfig_DefaultsAndWatermarkError(t *testing.T) {
 	t.Setenv("ENABLE_WATERMARK", "false")
 	t.Setenv("PORT", "9090")
 	t.Setenv("MAX_SOURCE_PIXELS", "12345")
+	t.Setenv("LOG_MEMORY", "true")
 	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatal(err)
@@ -34,6 +36,9 @@ func TestLoadConfig_DefaultsAndWatermarkError(t *testing.T) {
 		t.Fatalf("%+v", cfg)
 	}
 	if cfg.MaxSourcePixels != 12345 {
+		t.Fatalf("%+v", cfg)
+	}
+	if !cfg.LogMemory {
 		t.Fatalf("%+v", cfg)
 	}
 }
