@@ -98,10 +98,12 @@ func (p *Processor) Process(ctx context.Context, event storageEvent) error {
 	}
 	p.logMemory(event.Name, fmt.Sprintf("read original bytes=%d", len(originalBytes)))
 	if p.cfg.MaxSourcePixels > 0 {
-		if imgCfg, _, err := image.DecodeConfig(bytes.NewReader(originalBytes)); err == nil {
-			if err := validateSourceImageSize(imgCfg.Width, imgCfg.Height, p.cfg.MaxSourcePixels); err != nil {
-				return err
-			}
+		imgCfg, _, err := image.DecodeConfig(bytes.NewReader(originalBytes))
+		if err != nil {
+			return fmt.Errorf("decode image config: %w", err)
+		}
+		if err := validateSourceImageSize(imgCfg.Width, imgCfg.Height, p.cfg.MaxSourcePixels); err != nil {
+			return err
 		}
 	}
 	sourceImg, _, err := image.Decode(bytes.NewReader(originalBytes))
@@ -347,18 +349,16 @@ func applyWatermark(base *image.NRGBA, watermark *image.NRGBA, scale, marginRati
 		y = 0
 	}
 
-	result := cloneNRGBA(base)
 	rect := image.Rect(x, y, x+scaled.Bounds().Dx(), y+scaled.Bounds().Dy())
-	imagedraw.Draw(result, rect, scaled, image.Point{}, imagedraw.Over)
-	return result
+	imagedraw.Draw(base, rect, scaled, image.Point{}, imagedraw.Over)
+	return base
 }
 
 func adjustOpacity(img *image.NRGBA, opacity float64) *image.NRGBA {
-	out := cloneNRGBA(img)
-	for i := 3; i < len(out.Pix); i += 4 {
-		out.Pix[i] = uint8(float64(out.Pix[i]) * opacity)
+	for i := 3; i < len(img.Pix); i += 4 {
+		img.Pix[i] = uint8(float64(img.Pix[i]) * opacity)
 	}
-	return out
+	return img
 }
 
 func encodeByExt(img image.Image, ext string) ([]byte, error) {
@@ -423,8 +423,10 @@ func rotate180(src image.Image) *image.NRGBA {
 	height := bounds.Dy()
 	dst := image.NewNRGBA(image.Rect(0, 0, width, height))
 	for y := 0; y < height; y++ {
+		srcOffset := y * img.Stride
 		for x := 0; x < width; x++ {
-			dst.Set(width-1-x, height-1-y, img.At(x, y))
+			dstOffset := (height-1-y)*dst.Stride + (width-1-x)*4
+			copy(dst.Pix[dstOffset:dstOffset+4], img.Pix[srcOffset+x*4:srcOffset+x*4+4])
 		}
 	}
 	return dst
@@ -437,8 +439,10 @@ func rotate90CW(src image.Image) *image.NRGBA {
 	height := bounds.Dy()
 	dst := image.NewNRGBA(image.Rect(0, 0, height, width))
 	for y := 0; y < height; y++ {
+		srcOffset := y * img.Stride
 		for x := 0; x < width; x++ {
-			dst.Set(height-1-y, x, img.At(x, y))
+			dstOffset := x*dst.Stride + (height-1-y)*4
+			copy(dst.Pix[dstOffset:dstOffset+4], img.Pix[srcOffset+x*4:srcOffset+x*4+4])
 		}
 	}
 	return dst
@@ -451,8 +455,10 @@ func rotate90CCW(src image.Image) *image.NRGBA {
 	height := bounds.Dy()
 	dst := image.NewNRGBA(image.Rect(0, 0, height, width))
 	for y := 0; y < height; y++ {
+		srcOffset := y * img.Stride
 		for x := 0; x < width; x++ {
-			dst.Set(y, width-1-x, img.At(x, y))
+			dstOffset := (width-1-x)*dst.Stride + y*4
+			copy(dst.Pix[dstOffset:dstOffset+4], img.Pix[srcOffset+x*4:srcOffset+x*4+4])
 		}
 	}
 	return dst
@@ -469,15 +475,31 @@ func encodeWebP(img image.Image) ([]byte, error) {
 func encodeWebPToWriter(w io.Writer, img image.Image) error {
 	return webp.Encode(w, img, webp.Options{
 		Quality: 85,
-		Method:  4,
+		Method:  2,
 	})
 }
 
 func flattenIfNeeded(img image.Image) image.Image {
+	switch typed := img.(type) {
+	case *image.NRGBA:
+		if !hasAlpha(typed) {
+			return typed
+		}
+		return flattenNRGBA(typed)
+	case *image.RGBA:
+		if !hasAlphaRGBA(typed) {
+			return typed
+		}
+	}
+
 	nrgba := toNRGBA(img)
 	if !hasAlpha(nrgba) {
 		return nrgba
 	}
+	return flattenNRGBA(nrgba)
+}
+
+func flattenNRGBA(nrgba *image.NRGBA) *image.RGBA {
 	rgba := image.NewRGBA(nrgba.Bounds())
 	imagedraw.Draw(rgba, rgba.Bounds(), image.NewUniform(image.White), image.Point{}, imagedraw.Src)
 	imagedraw.Draw(rgba, rgba.Bounds(), nrgba, image.Point{}, imagedraw.Over)
@@ -485,6 +507,15 @@ func flattenIfNeeded(img image.Image) image.Image {
 }
 
 func hasAlpha(img *image.NRGBA) bool {
+	for i := 3; i < len(img.Pix); i += 4 {
+		if img.Pix[i] != 0xff {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAlphaRGBA(img *image.RGBA) bool {
 	for i := 3; i < len(img.Pix); i += 4 {
 		if img.Pix[i] != 0xff {
 			return true
