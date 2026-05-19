@@ -32,6 +32,7 @@ HTTP endpoint:
 - `WATERMARK_OPACITY`: `0` 到 `1`，預設 `1.0`
 - `CACHE_CONTROL`: 上傳到 GCS 時寫入的 cache control，預設 `public, max-age=31536000`
 - `MAX_SOURCE_PIXELS`: 原圖 decode 前允許的最高像素數，預設 `60000000`；設為 `0` 可關閉限制
+- `LOG_MEMORY`: 設為 `true` 時，處理每張圖會輸出 Go heap memory checkpoints，方便排查 Cloud Run OOM
 
 ## 本機執行
 

@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 
 	"cloud.google.com/go/storage"
@@ -57,6 +58,7 @@ func NewProcessor(cfg Config, storageClient *storage.Client) (*Processor, error)
 }
 
 func (p *Processor) Process(ctx context.Context, event storageEvent) error {
+	p.logMemory(event.Name, "start")
 	if !isSupportedImage(event.Name) {
 		log.Printf("skip unsupported object: %s", event.Name)
 		return nil
@@ -92,6 +94,7 @@ func (p *Processor) Process(ctx context.Context, event storageEvent) error {
 	if err != nil {
 		return fmt.Errorf("read object: %w", err)
 	}
+	p.logMemory(event.Name, fmt.Sprintf("read original bytes=%d", len(originalBytes)))
 	if p.cfg.MaxSourcePixels > 0 {
 		if imgCfg, _, err := image.DecodeConfig(bytes.NewReader(originalBytes)); err == nil {
 			if err := validateSourceImageSize(imgCfg.Width, imgCfg.Height, p.cfg.MaxSourcePixels); err != nil {
@@ -104,44 +107,81 @@ func (p *Processor) Process(ctx context.Context, event storageEvent) error {
 		return fmt.Errorf("decode image: %w", err)
 	}
 	sourceImg = applyEXIFOrientation(sourceImg, originalBytes)
+	originalBytes = nil
+	p.logMemory(event.Name, fmt.Sprintf("decoded source bounds=%s", sourceImg.Bounds()))
 
 	originalWebPBytes, err := encodeWebP(sourceImg)
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", originalWebPName, err)
 	}
+	p.logMemory(event.Name, fmt.Sprintf("encoded original webp bytes=%d", len(originalWebPBytes)))
 	if err := p.uploadObject(ctx, event.Bucket, originalWebPName, "image/webp", originalWebPBytes, event.Generation); err != nil {
 		return err
 	}
+	originalWebPBytes = nil
+	p.logMemory(event.Name, "uploaded original webp")
 
 	for _, target := range p.cfg.ResizeTargets {
 		resized := resizeImage(sourceImg, target.Width)
 		if p.cfg.EnableWatermark {
 			resized = applyWatermark(resized, p.watermark, p.cfg.WatermarkScale, p.cfg.WatermarkMarginRatio, p.cfg.WatermarkOpacity)
 		}
+		p.logMemory(event.Name, fmt.Sprintf("resized target=%s bounds=%s", target.Label, resized.Bounds()))
 
 		mainObjectName := baseDir + imageFileID + "-" + target.Label + ext
 		mainBytes, err := encodeByExt(resized, ext)
 		if err != nil {
 			return fmt.Errorf("encode %s: %w", mainObjectName, err)
 		}
+		p.logMemory(event.Name, fmt.Sprintf("encoded target=%s format=%s bytes=%d", target.Label, ext, len(mainBytes)))
 		if err := p.uploadObject(ctx, event.Bucket, mainObjectName, contentTypeFromExt(ext), mainBytes, event.Generation); err != nil {
 			return err
 		}
+		mainBytes = nil
+		p.logMemory(event.Name, fmt.Sprintf("uploaded target=%s format=%s", target.Label, ext))
 
 		webpObjectName := baseDir + imageFileID + "-" + target.Label + ".webP"
 		webpBytes, err := encodeWebP(resized)
 		if err != nil {
 			return fmt.Errorf("encode %s: %w", webpObjectName, err)
 		}
+		p.logMemory(event.Name, fmt.Sprintf("encoded target=%s format=.webP bytes=%d", target.Label, len(webpBytes)))
 		if err := p.uploadObject(ctx, event.Bucket, webpObjectName, "image/webp", webpBytes, event.Generation); err != nil {
 			return err
 		}
 
-		mainBytes = nil
 		webpBytes = nil
+		resized = nil
+		p.logMemory(event.Name, fmt.Sprintf("uploaded target=%s format=.webP", target.Label))
 	}
 
+	sourceImg = nil
+	p.logMemory(event.Name, "done")
 	return nil
+}
+
+func (p *Processor) logMemory(objectName, checkpoint string) {
+	if !p.cfg.LogMemory {
+		return
+	}
+
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	log.Printf(
+		"memory checkpoint object=%s checkpoint=%q heap_alloc_mib=%d heap_sys_mib=%d heap_idle_mib=%d heap_released_mib=%d stack_inuse_mib=%d num_gc=%d",
+		objectName,
+		checkpoint,
+		bytesToMiB(stats.HeapAlloc),
+		bytesToMiB(stats.HeapSys),
+		bytesToMiB(stats.HeapIdle),
+		bytesToMiB(stats.HeapReleased),
+		bytesToMiB(stats.StackInuse),
+		stats.NumGC,
+	)
+}
+
+func bytesToMiB(v uint64) uint64 {
+	return v / 1024 / 1024
 }
 
 func (p *Processor) alreadyProcessedSourceGeneration(ctx context.Context, bucketName, sentinelObjectName, sourceGeneration string) (bool, error) {

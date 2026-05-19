@@ -17,6 +17,7 @@ type Config struct {
 	WatermarkOpacity     float64
 	CacheControl         string
 	MaxSourcePixels      int
+	LogMemory            bool
 }
 
 type ResizeTarget struct {
@@ -40,6 +41,7 @@ func LoadConfig() (Config, error) {
 		WatermarkOpacity:     parseFloatEnv("WATERMARK_OPACITY", 1.0),
 		CacheControl:         envOrDefault("CACHE_CONTROL", "public, max-age=31536000"),
 		MaxSourcePixels:      parseIntEnv("MAX_SOURCE_PIXELS", 60000000),
+		LogMemory:            parseBoolEnv("LOG_MEMORY", false),
 	}
 
 	if cfg.EnableWatermark && cfg.WatermarkPath == "" {
